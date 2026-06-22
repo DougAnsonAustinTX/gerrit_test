@@ -4,6 +4,26 @@ set -Eeuo pipefail
 ###############################################################################
 # Gerrit basic performance lab for Ubuntu 24.04
 #
+# v19 changes:
+#   - Fixes Prometheus snapshot collection so large Gerrit metric query results
+#     are written to temporary JSON files and loaded with jq --slurpfile instead
+#     of being passed through --argjson command-line arguments. This avoids
+#     "Argument list too long" when Gerrit metrics are enabled.
+#
+# v18 changes:
+#   - Fixes metrics-reporter-prometheus bearer token key to prometheusBearerToken
+#     and adds stronger diagnostics around metrics auth probing.
+#
+# v17 changes:
+#   - Makes Gerrit Prometheus metrics required by default and verifies the scrape
+#     before running load. Captures JVM, GC, Jetty, cache, queue, and Gerrit timing
+#     metric snapshots alongside node metrics.
+#   - Runs stepwise concurrency stages by default instead of a single jump in load.
+#   - Adds a production-like synthetic repository profile with more projects,
+#     changes, and larger packfile input data.
+#   - If Gerrit is already running when the script starts, stops it first and then
+#     starts it cleanly through this script before the workload.
+#
 # v14 changes:
 #   - Creates the HTTP ACL validation project through Gerrit REST first, so Gerrit
 #     registers the project before the seed-push permission check.
@@ -43,11 +63,13 @@ set -Eeuo pipefail
 #   - Keeps systemd-safe Gerrit startup and Prometheus setup.
 #
 # Run:
-#   chmod +x gerrit_perf_lab_v14.sh
-#   sudo ./gerrit_perf_lab_v14.sh
+#   chmod +x gerrit_perf_lab_v19.sh
+#   sudo ./gerrit_perf_lab_v19.sh
 #
 # Optional:
-#   sudo GERRIT_VERSION=3.11.2 TEST_DURATION_SECONDS=180 ./gerrit_perf_lab_v14.sh
+#   sudo GERRIT_VERSION=3.11.2 TEST_DURATION_SECONDS=180 ./gerrit_perf_lab_v19.sh
+#   sudo SYNTH_PROFILE=production_like ./gerrit_perf_lab_v19.sh
+#   sudo CONCURRENCY_STEPS="2,1,1 4,2,1 6,3,2 8,4,2" ./gerrit_perf_lab_v19.sh
 #
 # WARNING:
 #   This is intentionally permissive for local lab testing only.
@@ -82,15 +104,41 @@ TEST_ROOT="${TEST_ROOT:-/var/tmp/gerrit-perf-lab}"
 RESULT_DIR="${RESULT_DIR:-${TEST_ROOT}/results}"
 WORK_DIR="${WORK_DIR:-${TEST_ROOT}/work}"
 
-SYNTH_PROJECTS="${SYNTH_PROJECTS:-3}"
-SYNTH_INITIAL_FILES="${SYNTH_INITIAL_FILES:-80}"
-SYNTH_INITIAL_COMMITS="${SYNTH_INITIAL_COMMITS:-20}"
-SYNTH_CHANGES_PER_PROJECT="${SYNTH_CHANGES_PER_PROJECT:-15}"
+SYNTH_PROFILE="${SYNTH_PROFILE:-standard}"
+case "$SYNTH_PROFILE" in
+  standard)
+    SYNTH_PROJECTS="${SYNTH_PROJECTS:-3}"
+    SYNTH_INITIAL_FILES="${SYNTH_INITIAL_FILES:-80}"
+    SYNTH_INITIAL_COMMITS="${SYNTH_INITIAL_COMMITS:-20}"
+    SYNTH_CHANGES_PER_PROJECT="${SYNTH_CHANGES_PER_PROJECT:-15}"
+    SYNTH_LARGE_FILES_PER_PROJECT="${SYNTH_LARGE_FILES_PER_PROJECT:-0}"
+    SYNTH_LARGE_FILE_KB="${SYNTH_LARGE_FILE_KB:-0}"
+    ;;
+  production_like|large)
+    SYNTH_PROJECTS="${SYNTH_PROJECTS:-8}"
+    SYNTH_INITIAL_FILES="${SYNTH_INITIAL_FILES:-300}"
+    SYNTH_INITIAL_COMMITS="${SYNTH_INITIAL_COMMITS:-50}"
+    SYNTH_CHANGES_PER_PROJECT="${SYNTH_CHANGES_PER_PROJECT:-40}"
+    SYNTH_LARGE_FILES_PER_PROJECT="${SYNTH_LARGE_FILES_PER_PROJECT:-8}"
+    SYNTH_LARGE_FILE_KB="${SYNTH_LARGE_FILE_KB:-1024}"
+    ;;
+  *)
+    echo "Unknown SYNTH_PROFILE=${SYNTH_PROFILE}; expected standard or production_like." >&2
+    exit 1
+    ;;
+esac
 
 TEST_DURATION_SECONDS="${TEST_DURATION_SECONDS:-120}"
 REST_CONCURRENCY="${REST_CONCURRENCY:-6}"
 GIT_CONCURRENCY="${GIT_CONCURRENCY:-3}"
 PUSH_CONCURRENCY="${PUSH_CONCURRENCY:-2}"
+CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-2,1,1 4,2,1 6,3,2 8,4,2}"
+REQUIRE_GERRIT_METRICS="${REQUIRE_GERRIT_METRICS:-true}"
+GERRIT_PROMETHEUS_PLUGIN_JAR="${GERRIT_PROMETHEUS_PLUGIN_JAR:-}"
+
+INITIAL_GERRIT_WAS_RUNNING="false"
+GERRIT_METRICS_AUTH_MODE="unknown"
+GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG=""
 
 GERRIT_BASE_URL="http://127.0.0.1:${GERRIT_HTTP_PORT}"
 GERRIT_TEST_HTTP_USER="${GERRIT_TEST_HTTP_USER:-admin}"
@@ -183,27 +231,119 @@ prom_query() {
   curl -fsS --get "${PROM_URL}/api/v1/query" --data-urlencode "query=${query}" || true
 }
 
+capture_prometheus_query_result() {
+  local query="$1"
+  local file="$2"
+
+  local tmp="${file}.tmp"
+  if prom_query "$query" | jq '.data.result // []' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    printf '%s\n' '[]' > "$file"
+  fi
+}
+
 capture_prometheus_snapshot() {
   local label="$1"
   local file="${RUN_DIR}/prometheus_${label}.json"
+  local snap_dir="${RUN_DIR}/prometheus_${label}_parts"
+
+  rm -rf "$snap_dir"
+  mkdir -p "$snap_dir"
+
+  # Do not pass Prometheus result arrays via jq --argjson. When Gerrit metrics
+  # are enabled, the metric payload can be large enough to exceed the kernel
+  # argv/env limit and abort the script with "Argument list too long". Store
+  # each query result in a file and load it with jq --slurpfile instead.
+  capture_prometheus_query_result '100 - avg(rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100' "${snap_dir}/cpu.json"
+  capture_prometheus_query_result '100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))' "${snap_dir}/mem.json"
+  capture_prometheus_query_result 'rate(node_disk_io_time_seconds_total[1m])' "${snap_dir}/diskio.json"
+  capture_prometheus_query_result 'up{job="gerrit"}' "${snap_dir}/gerrit_up.json"
+  capture_prometheus_query_result 'up{job="node"}' "${snap_dir}/node_up.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*jvm.*memory.*|.*jvm.*heap.*"}' "${snap_dir}/jvm_heap.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*jvm.*thread.*"}' "${snap_dir}/jvm_threads.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*gc.*|.*garbage.*"}' "${snap_dir}/gc.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*jetty.*|.*http.*server.*"}' "${snap_dir}/jetty.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*cache.*"}' "${snap_dir}/caches.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*queue.*|.*executor.*|.*thread.*pool.*"}' "${snap_dir}/queues.json"
+  capture_prometheus_query_result '{job="gerrit",__name__=~".*gerrit.*|.*git.*|.*review.*|.*change.*|.*latency.*|.*duration.*"}' "${snap_dir}/gerrit_timers.json"
 
   jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson cpu "$(prom_query '100 - avg(rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100' | jq '.data.result // []' 2>/dev/null || echo '[]')" \
-    --argjson mem "$(prom_query '100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))' | jq '.data.result // []' 2>/dev/null || echo '[]')" \
-    --argjson diskio "$(prom_query 'rate(node_disk_io_time_seconds_total[1m])' | jq '.data.result // []' 2>/dev/null || echo '[]')" \
-    --argjson gerrit_up "$(prom_query 'up{job="gerrit"}' | jq '.data.result // []' 2>/dev/null || echo '[]')" \
-    --argjson node_up "$(prom_query 'up{job="node"}' | jq '.data.result // []' 2>/dev/null || echo '[]')" \
+    --slurpfile cpu "${snap_dir}/cpu.json" \
+    --slurpfile mem "${snap_dir}/mem.json" \
+    --slurpfile diskio "${snap_dir}/diskio.json" \
+    --slurpfile gerrit_up "${snap_dir}/gerrit_up.json" \
+    --slurpfile node_up "${snap_dir}/node_up.json" \
+    --slurpfile jvm_heap "${snap_dir}/jvm_heap.json" \
+    --slurpfile jvm_threads "${snap_dir}/jvm_threads.json" \
+    --slurpfile gc "${snap_dir}/gc.json" \
+    --slurpfile jetty "${snap_dir}/jetty.json" \
+    --slurpfile caches "${snap_dir}/caches.json" \
+    --slurpfile queues "${snap_dir}/queues.json" \
+    --slurpfile gerrit_timers "${snap_dir}/gerrit_timers.json" \
     '{
       timestamp: $ts,
-      cpu_percent: $cpu,
-      memory_used_percent: $mem,
-      disk_io_time_rate: $diskio,
-      gerrit_up: $gerrit_up,
-      node_up: $node_up
-    }' > "$file"
+      cpu_percent: ($cpu[0] // []),
+      memory_used_percent: ($mem[0] // []),
+      disk_io_time_rate: ($diskio[0] // []),
+      gerrit_up: ($gerrit_up[0] // []),
+      node_up: ($node_up[0] // []),
+      gerrit_server_metrics: {
+        jvm_heap: ($jvm_heap[0] // []),
+        jvm_threads: ($jvm_threads[0] // []),
+        gc: ($gc[0] // []),
+        jetty: ($jetty[0] // []),
+        caches: ($caches[0] // []),
+        queues: ($queues[0] // []),
+        gerrit_timers: ($gerrit_timers[0] // [])
+      }
+    }' > "${file}.tmp"
+
+  mv "${file}.tmp" "$file"
 }
 
+is_gerrit_running_now() {
+  if systemctl is-active --quiet gerrit-perf-lab.service 2>/dev/null; then
+    return 0
+  fi
+
+  if [[ -x "${GERRIT_SITE}/bin/gerrit.sh" ]] && "${GERRIT_SITE}/bin/gerrit.sh" status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${GERRIT_HTTP_PORT}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${GERRIT_SSH_PORT}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+handle_initial_gerrit_state() {
+  if is_gerrit_running_now; then
+    INITIAL_GERRIT_WAS_RUNNING="true"
+    log "Gerrit appears to already be running at script start; stopping it before setup."
+    stop_any_gerrit
+    sleep 3
+
+    if is_gerrit_running_now; then
+      print_gerrit_diagnostics
+      die "Gerrit was running initially and did not stop cleanly. Refusing to continue."
+    fi
+
+    log "Initial Gerrit instance stopped. The script will start a clean Gerrit instance later."
+  else
+    log "No initially running Gerrit instance detected."
+  fi
+}
+
+###############################################################################
+# Install dependencies
 ###############################################################################
 # Install dependencies
 ###############################################################################
@@ -343,44 +483,57 @@ init_gerrit() {
     allowRemoteAdmin = true
 
 [plugin "metrics-reporter-prometheus"]
-    bearerToken = ${PROM_BEARER_TOKEN}
+    # metrics-reporter-prometheus expects this exact key.
+    # v17 used bearerToken, which the plugin ignored and caused HTTP 403.
+    prometheusBearerToken = ${PROM_BEARER_TOKEN}
 EOF_CONFIG
 
   chown -R "$GERRIT_USER:$GERRIT_USER" "$GERRIT_SITE"
 }
 
 install_prometheus_plugin() {
-  log "Attempting to install metrics-reporter-prometheus plugin."
+  log "Installing metrics-reporter-prometheus plugin."
 
   local plugin_target="${GERRIT_SITE}/plugins/metrics-reporter-prometheus.jar"
+  mkdir -p "${GERRIT_SITE}/plugins"
 
-  if [[ -f "$plugin_target" ]]; then
-    log "Prometheus plugin already present."
-    chown "$GERRIT_USER:$GERRIT_USER" "$plugin_target"
-    return
+  if [[ -n "$GERRIT_PROMETHEUS_PLUGIN_JAR" ]]; then
+    [[ -f "$GERRIT_PROMETHEUS_PLUGIN_JAR" ]] || die "GERRIT_PROMETHEUS_PLUGIN_JAR does not exist: ${GERRIT_PROMETHEUS_PLUGIN_JAR}"
+    cp -f "$GERRIT_PROMETHEUS_PLUGIN_JAR" "$plugin_target"
+  elif [[ -f "$plugin_target" ]]; then
+    log "Prometheus plugin already present at ${plugin_target}."
+  else
+    local gerrit_minor="${GERRIT_VERSION%.*}"
+    local candidates=(
+      "https://gerrit-ci.gerritforge.com/job/plugin-metrics-reporter-prometheus-bazel-stable-${gerrit_minor}/lastSuccessfulBuild/artifact/bazel-bin/plugins/metrics-reporter-prometheus/metrics-reporter-prometheus.jar"
+      "https://gerrit-ci.gerritforge.com/job/plugin-metrics-reporter-prometheus-bazel-stable-${GERRIT_VERSION}/lastSuccessfulBuild/artifact/bazel-bin/plugins/metrics-reporter-prometheus/metrics-reporter-prometheus.jar"
+      "https://gerrit-ci.gerritforge.com/job/plugin-metrics-reporter-prometheus-bazel-master/lastSuccessfulBuild/artifact/bazel-bin/plugins/metrics-reporter-prometheus/metrics-reporter-prometheus.jar"
+    )
+
+    local downloaded="false"
+    for url in "${candidates[@]}"; do
+      log "Trying plugin URL: $url"
+      if curl -fL --retry 2 --connect-timeout 20 "$url" -o "${plugin_target}.tmp"; then
+        mv -f "${plugin_target}.tmp" "$plugin_target"
+        downloaded="true"
+        break
+      fi
+      rm -f "${plugin_target}.tmp"
+    done
+
+    if [[ "$downloaded" != "true" ]]; then
+      if [[ "$REQUIRE_GERRIT_METRICS" == "true" ]]; then
+        die "Could not download metrics-reporter-prometheus plugin. Provide GERRIT_PROMETHEUS_PLUGIN_JAR=/path/to/metrics-reporter-prometheus.jar or set REQUIRE_GERRIT_METRICS=false."
+      fi
+      warn "Could not download metrics-reporter-prometheus plugin automatically. Continuing because REQUIRE_GERRIT_METRICS=false."
+      rm -f "$plugin_target"
+      return
+    fi
   fi
 
-  local gerrit_minor="${GERRIT_VERSION%.*}"
-  local candidates=(
-    "https://gerrit-ci.gerritforge.com/job/plugin-metrics-reporter-prometheus-bazel-stable-${gerrit_minor}/lastSuccessfulBuild/artifact/bazel-bin/plugins/metrics-reporter-prometheus/metrics-reporter-prometheus.jar"
-    "https://gerrit-ci.gerritforge.com/job/plugin-metrics-reporter-prometheus-bazel-master/lastSuccessfulBuild/artifact/bazel-bin/plugins/metrics-reporter-prometheus/metrics-reporter-prometheus.jar"
-  )
-
-  local downloaded="false"
-  for url in "${candidates[@]}"; do
-    log "Trying plugin URL: $url"
-    if curl -fL "$url" -o "$plugin_target"; then
-      downloaded="true"
-      break
-    fi
-  done
-
-  if [[ "$downloaded" != "true" ]]; then
-    warn "Could not download metrics-reporter-prometheus plugin automatically."
-    warn "The test will still collect node_exporter and client-side metrics."
-    warn "You can manually place metrics-reporter-prometheus.jar at: ${plugin_target}"
+  if ! unzip -tq "$plugin_target" >/dev/null 2>&1; then
     rm -f "$plugin_target"
-    return
+    die "Downloaded Prometheus plugin is not a valid jar: ${plugin_target}"
   fi
 
   chown "$GERRIT_USER:$GERRIT_USER" "$plugin_target"
@@ -479,11 +632,6 @@ configure_prometheus() {
   cp -a /etc/prometheus/prometheus.yml "/etc/prometheus/prometheus.yml.bak.${RUN_ID}" 2>/dev/null || true
 
   cat > /etc/prometheus/prometheus.yml <<EOF_PROM
-state: invalid
-EOF_PROM
-
-  # Rewrite in two steps to avoid partially written YAML if an edit is interrupted.
-  cat > /etc/prometheus/prometheus.yml <<EOF_PROM
 scrape_configs:
   - job_name: "prometheus"
     static_configs:
@@ -496,16 +644,22 @@ scrape_configs:
   - job_name: "gerrit"
     metrics_path: "${GERRIT_METRICS_PATH}"
     scheme: "http"
-    authorization:
-      type: "Bearer"
-      credentials: "${PROM_BEARER_TOKEN}"
-    static_configs:
+${GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG}    static_configs:
       - targets: ["127.0.0.1:${GERRIT_HTTP_PORT}"]
 
 global:
   scrape_interval: 5s
   evaluation_interval: 5s
 EOF_PROM
+
+  if command -v promtool >/dev/null 2>&1; then
+    if ! promtool check config /etc/prometheus/prometheus.yml >/dev/null 2>&1; then
+      promtool check config /etc/prometheus/prometheus.yml || true
+      die "Prometheus configuration validation failed."
+    fi
+  else
+    warn "promtool not found; skipping Prometheus config validation."
+  fi
 
   systemctl restart prometheus-node-exporter
   systemctl restart prometheus
@@ -517,6 +671,111 @@ EOF_PROM
   fi
 }
 
+probe_gerrit_metrics() {
+  local mode="$1"
+  local out_file="$2"
+
+  case "$mode" in
+    bearer)
+      curl -fsS -H "Authorization: Bearer ${PROM_BEARER_TOKEN}" "$GERRIT_METRICS_URL" -o "$out_file"
+      ;;
+    basic)
+      curl -fsS -u "${GERRIT_TEST_HTTP_USER}:${GERRIT_TEST_HTTP_PASSWORD}" "$GERRIT_METRICS_URL" -o "$out_file"
+      ;;
+    none)
+      curl -fsS "$GERRIT_METRICS_URL" -o "$out_file"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+select_gerrit_metrics_auth_mode() {
+  log "Verifying Gerrit Prometheus metrics endpoint."
+
+  mkdir -p "$RUN_DIR"
+  local sample="${RUN_DIR}/gerrit_metrics_startup_sample.txt"
+  : > "$sample"
+
+  local mode
+  for mode in bearer none basic; do
+    if probe_gerrit_metrics "$mode" "$sample"; then
+      if grep -Eq '(^# HELP|^# TYPE|^[a-zA-Z_:][a-zA-Z0-9_:]*[{ ]|^plugins_|^proc_|^jvm_|^jetty_|^caches_|^git_|^http_)' "$sample"; then
+        GERRIT_METRICS_AUTH_MODE="$mode"
+        case "$mode" in
+          bearer)
+            printf -v GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG '    bearer_token: "%s"\n' "$PROM_BEARER_TOKEN"
+            ;;
+          basic)
+            printf -v GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG '    basic_auth:\n      username: "%s"\n      password: "%s"\n' "$GERRIT_TEST_HTTP_USER" "$GERRIT_TEST_HTTP_PASSWORD"
+            ;;
+          none)
+            GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG=""
+            ;;
+        esac
+        log "Gerrit metrics endpoint is reachable using auth mode: ${GERRIT_METRICS_AUTH_MODE}."
+        cp -f "$sample" "${RUN_DIR}/gerrit_metrics_sample.txt"
+        return 0
+      fi
+    fi
+  done
+
+  print_gerrit_diagnostics
+  echo "==================== Prometheus plugin files ===================="
+  ls -l "${GERRIT_SITE}/plugins" || true
+  echo "==================== Gerrit metrics endpoint probe ===================="
+  echo "-- bearer token probe --"
+  curl -sv -H "Authorization: Bearer ${PROM_BEARER_TOKEN}" "$GERRIT_METRICS_URL" -o /tmp/gerrit-metrics-probe.out 2>&1 || true
+  sed -n '1,160p' /tmp/gerrit-metrics-probe.out || true
+  echo "-- anonymous probe --"
+  curl -sv "$GERRIT_METRICS_URL" -o /tmp/gerrit-metrics-probe-none.out 2>&1 || true
+  sed -n '1,120p' /tmp/gerrit-metrics-probe-none.out || true
+  echo "-- basic auth probe --"
+  curl -sv -u "${GERRIT_TEST_HTTP_USER}:${GERRIT_TEST_HTTP_PASSWORD}" "$GERRIT_METRICS_URL" -o /tmp/gerrit-metrics-probe-basic.out 2>&1 || true
+  sed -n '1,120p' /tmp/gerrit-metrics-probe-basic.out || true
+  echo "-- configured plugin stanza --"
+  sed -n '/\[plugin "metrics-reporter-prometheus"\]/,/^\[/p' "${GERRIT_SITE}/etc/gerrit.config" | sed -e 's/prometheusBearerToken = .*/prometheusBearerToken = REDACTED/' || true
+  rm -f /tmp/gerrit-metrics-probe.out /tmp/gerrit-metrics-probe-none.out /tmp/gerrit-metrics-probe-basic.out
+
+  if [[ "$REQUIRE_GERRIT_METRICS" == "true" ]]; then
+    die "Gerrit Prometheus metrics endpoint is unavailable. v18 writes plugin.metrics-reporter-prometheus.prometheusBearerToken; if this still fails, inspect the plugin stanza and target status printed above."
+  fi
+
+  warn "Gerrit metrics endpoint unavailable, continuing because REQUIRE_GERRIT_METRICS=false."
+  GERRIT_METRICS_AUTH_MODE="unavailable"
+  GERRIT_METRICS_PROMETHEUS_AUTH_CONFIG=""
+}
+
+verify_prometheus_gerrit_scrape() {
+  log "Verifying Prometheus can scrape Gerrit."
+
+  local waited=0
+  local val=""
+  while [[ "$waited" -lt 90 ]]; do
+    val="$(prom_query 'up{job="gerrit"}' | jq -r '.data.result[0].value[1] // empty' 2>/dev/null || true)"
+    if [[ "$val" == "1" ]]; then
+      log "Prometheus Gerrit scrape is up."
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  echo "==================== Prometheus target status ===================="
+  curl -fsS "${PROM_URL}/api/v1/targets" | jq '.data.activeTargets[]? | select(.labels.job == "gerrit")' || true
+  echo "==================== Last metrics endpoint sample ===================="
+  sed -n '1,80p' "${RUN_DIR}/gerrit_metrics_sample.txt" 2>/dev/null || true
+
+  if [[ "$REQUIRE_GERRIT_METRICS" == "true" ]]; then
+    die "Prometheus reports up{job="gerrit"}=${val:-empty}; Gerrit server-side metrics are not being scraped."
+  fi
+
+  warn "Prometheus Gerrit scrape is not up, continuing because REQUIRE_GERRIT_METRICS=false."
+}
+
+###############################################################################
+# Gerrit admin setup and synthetic data
 ###############################################################################
 # Gerrit admin setup and synthetic data
 ###############################################################################
@@ -628,6 +887,8 @@ EOF_GROUPS
 
 [capability]
 	administrateServer = group Administrators
+	viewMetrics = group Anonymous Users
+	viewMetrics = group Registered Users
 	createProject = group Anonymous Users
 	createProject = group Registered Users
 
@@ -794,6 +1055,32 @@ PY
       } > "src/module-$((f % 10))/file-${f}.txt"
     done
 
+    if [[ "$SYNTH_LARGE_FILES_PER_PROJECT" -gt 0 && "$SYNTH_LARGE_FILE_KB" -gt 0 ]]; then
+      mkdir -p large-packfiles
+      log "Adding ${SYNTH_LARGE_FILES_PER_PROJECT} large packfile inputs of ${SYNTH_LARGE_FILE_KB} KiB to ${local_project}."
+      python3 - <<PYLARGE
+from pathlib import Path
+import os
+root = Path("large-packfiles")
+count = int("${SYNTH_LARGE_FILES_PER_PROJECT}")
+size = int("${SYNTH_LARGE_FILE_KB}") * 1024
+project = "${p}".encode()
+run_id = "${RUN_ID}".encode()
+for i in range(1, count + 1):
+    path = root / f"payload-{i:03d}.bin"
+    remaining = size
+    with path.open("wb") as fh:
+        fh.write(b"gerrit-perf-large-payload\n")
+        fh.write(b"project=" + project + b"\n")
+        fh.write(b"run_id=" + run_id + b"\n")
+        remaining -= fh.tell()
+        while remaining > 0:
+            chunk = os.urandom(min(1024 * 1024, remaining))
+            fh.write(chunk)
+            remaining -= len(chunk)
+PYLARGE
+    fi
+
     git add .
     git commit -m "Initial synthetic content for project ${p}"
 
@@ -840,9 +1127,10 @@ PY
 ###############################################################################
 
 run_rest_load_worker() {
-  local worker="$1"
-  local end_epoch="$2"
-  local out_file="$3"
+  local step_name="$1"
+  local worker="$2"
+  local end_epoch="$3"
+  local out_file="$4"
 
   while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
     local start_ns end_ns duration_ms status bytes tmp
@@ -861,18 +1149,20 @@ run_rest_load_worker() {
 
     jq -nc \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg step "$step_name" \
       --arg worker "$worker" \
       --arg status "$status" \
       --argjson duration_ms "$duration_ms" \
       --argjson bytes "$bytes" \
-      '{timestamp:$ts, type:"rest_change_query", worker:$worker, status:$status, duration_ms:$duration_ms, bytes:$bytes}' >> "$out_file"
+      '{timestamp:$ts, step:$step, type:"rest_change_query", worker:$worker, status:$status, duration_ms:$duration_ms, bytes:$bytes}' >> "$out_file"
   done
 }
 
 run_git_clone_worker() {
-  local worker="$1"
-  local end_epoch="$2"
-  local out_file="$3"
+  local step_name="$1"
+  local worker="$2"
+  local end_epoch="$3"
+  local out_file="$4"
 
   local idx=0
   while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
@@ -896,18 +1186,20 @@ run_git_clone_worker() {
 
     jq -nc \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg step "$step_name" \
       --arg worker "$worker" \
       --arg project "$project" \
       --arg status "$status" \
       --argjson duration_ms "$duration_ms" \
-      '{timestamp:$ts, type:"git_clone", worker:$worker, project:$project, status:$status, duration_ms:$duration_ms}' >> "$out_file"
+      '{timestamp:$ts, step:$step, type:"git_clone", worker:$worker, project:$project, status:$status, duration_ms:$duration_ms}' >> "$out_file"
   done
 }
 
 run_git_push_worker() {
-  local worker="$1"
-  local end_epoch="$2"
-  local out_file="$3"
+  local step_name="$1"
+  local worker="$2"
+  local end_epoch="$3"
+  local out_file="$4"
 
   local project_num=$(( (worker % SYNTH_PROJECTS) + 1 ))
   local project="perf/project-${project_num}"
@@ -917,9 +1209,10 @@ run_git_push_worker() {
   if ! git clone --quiet "${GERRIT_AUTH_BASE_URL}/${project}" "$repo_dir" >/dev/null 2>&1; then
     jq -nc \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg step "$step_name" \
       --arg worker "$worker" \
       --arg project "$project" \
-      '{timestamp:$ts, type:"git_push_refs_for", worker:$worker, project:$project, status:"clone_setup_fail", duration_ms:0}' >> "$out_file"
+      '{timestamp:$ts, step:$step, type:"git_push_refs_for", worker:$worker, project:$project, status:"clone_setup_fail", duration_ms:0}' >> "$out_file"
     return 0
   fi
 
@@ -954,11 +1247,12 @@ run_git_push_worker() {
 
     jq -nc \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg step "$step_name" \
       --arg worker "$worker" \
       --arg project "$project" \
       --arg status "$status" \
       --argjson duration_ms "$duration_ms" \
-      '{timestamp:$ts, type:"git_push_refs_for", worker:$worker, project:$project, status:$status, duration_ms:$duration_ms}' >> "$out_file"
+      '{timestamp:$ts, step:$step, type:"git_push_refs_for", worker:$worker, project:$project, status:$status, duration_ms:$duration_ms}' >> "$out_file"
 
     sleep 1
   done
@@ -967,8 +1261,47 @@ run_git_push_worker() {
   rm -rf "$repo_dir"
 }
 
+run_load_step() {
+  local step_name="$1"
+  local rest_concurrency="$2"
+  local git_concurrency="$3"
+  local push_concurrency="$4"
+  local raw_events="$5"
+
+  log "Running load step ${step_name}: REST=${rest_concurrency}, clone=${git_concurrency}, push=${push_concurrency}, duration=${TEST_DURATION_SECONDS}s."
+
+  capture_prometheus_snapshot "${step_name}_before"
+
+  local end_epoch=$(( $(date +%s) + TEST_DURATION_SECONDS ))
+  local pids=()
+
+  for w in $(seq 1 "$rest_concurrency"); do
+    run_rest_load_worker "$step_name" "$w" "$end_epoch" "$raw_events" &
+    pids+=("$!")
+  done
+
+  for w in $(seq 1 "$git_concurrency"); do
+    run_git_clone_worker "$step_name" "$w" "$end_epoch" "$raw_events" &
+    pids+=("$!")
+  done
+
+  for w in $(seq 1 "$push_concurrency"); do
+    run_git_push_worker "$step_name" "$w" "$end_epoch" "$raw_events" &
+    pids+=("$!")
+  done
+
+  sleep "$(( TEST_DURATION_SECONDS / 2 ))"
+  capture_prometheus_snapshot "${step_name}_during"
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+
+  capture_prometheus_snapshot "${step_name}_after"
+}
+
 run_performance_test() {
-  log "Running performance test for ${TEST_DURATION_SECONDS} seconds."
+  log "Running stepwise performance test."
 
   mkdir -p "$RUN_DIR" "${WORK_DIR}/load"
   chown -R "$GERRIT_USER:$GERRIT_USER" "$TEST_ROOT"
@@ -976,38 +1309,22 @@ run_performance_test() {
   local raw_events="${RUN_DIR}/events.ndjson"
   : > "$raw_events"
 
-  capture_prometheus_snapshot "before"
-
-  local end_epoch=$(( $(date +%s) + TEST_DURATION_SECONDS ))
-  local pids=()
-
-  for w in $(seq 1 "$REST_CONCURRENCY"); do
-    run_rest_load_worker "$w" "$end_epoch" "$raw_events" &
-    pids+=("$!")
+  local idx=0
+  local step rest git_clone push
+  for step in $CONCURRENCY_STEPS; do
+    idx=$((idx + 1))
+    IFS=',' read -r rest git_clone push <<< "$step"
+    [[ "$rest" =~ ^[0-9]+$ ]] || die "Invalid REST concurrency in CONCURRENCY_STEPS entry: ${step}"
+    [[ "$git_clone" =~ ^[0-9]+$ ]] || die "Invalid clone concurrency in CONCURRENCY_STEPS entry: ${step}"
+    [[ "$push" =~ ^[0-9]+$ ]] || die "Invalid push concurrency in CONCURRENCY_STEPS entry: ${step}"
+    run_load_step "step${idx}_r${rest}_c${git_clone}_p${push}" "$rest" "$git_clone" "$push" "$raw_events"
   done
 
-  for w in $(seq 1 "$GIT_CONCURRENCY"); do
-    run_git_clone_worker "$w" "$end_epoch" "$raw_events" &
-    pids+=("$!")
-  done
-
-  for w in $(seq 1 "$PUSH_CONCURRENCY"); do
-    run_git_push_worker "$w" "$end_epoch" "$raw_events" &
-    pids+=("$!")
-  done
-
-  sleep "$(( TEST_DURATION_SECONDS / 2 ))"
-  capture_prometheus_snapshot "during"
-
-  for pid in "${pids[@]}"; do
-    wait "$pid" || true
-  done
-
-  capture_prometheus_snapshot "after"
-
-  log "Performance test completed."
+  log "Stepwise performance test completed."
 }
 
+###############################################################################
+# JSON report
 ###############################################################################
 # JSON report
 ###############################################################################
@@ -1043,8 +1360,36 @@ build_json_report() {
     })
   ' "$raw_events" > "${RUN_DIR}/summary_by_operation.json"
 
+  jq -s '
+    def pct($p):
+      if length == 0 then null
+      else sort | .[((length - 1) * $p / 100 | floor)]
+      end;
+
+    group_by(.step) |
+    map({
+      step: .[0].step,
+      operations: (
+        group_by(.type) |
+        map({
+          type: .[0].type,
+          count: length,
+          ok_count: map(select(.status == "ok" or .status == "200")) | length,
+          fail_count: map(select(.status != "ok" and .status != "200")) | length,
+          min_ms: map(.duration_ms) | min,
+          avg_ms: ((map(.duration_ms) | add) / length),
+          p50_ms: (map(.duration_ms) | pct(50)),
+          p90_ms: (map(.duration_ms) | pct(90)),
+          p95_ms: (map(.duration_ms) | pct(95)),
+          p99_ms: (map(.duration_ms) | pct(99)),
+          max_ms: map(.duration_ms) | max
+        })
+      )
+    })
+  ' "$raw_events" > "${RUN_DIR}/summary_by_step.json"
+
   local gerrit_metrics_probe_status="unknown"
-  if curl -fsS -H "Authorization: Bearer ${PROM_BEARER_TOKEN}" "$GERRIT_METRICS_URL" -o "${RUN_DIR}/gerrit_metrics_sample.txt"; then
+  if probe_gerrit_metrics "$GERRIT_METRICS_AUTH_MODE" "${RUN_DIR}/gerrit_metrics_sample.txt"; then
     gerrit_metrics_probe_status="ok"
   else
     gerrit_metrics_probe_status="unavailable"
@@ -1060,6 +1405,16 @@ build_json_report() {
   local os_name
   os_name="$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
 
+  local prometheus_snapshots_json="${RUN_DIR}/prometheus_snapshots.json"
+  jq -n 'reduce inputs as $i ({}; . + {($i[0]): $i[1]})' < <(
+    for f in "${RUN_DIR}"/prometheus_*.json; do
+      [[ -f "$f" ]] || continue
+      b=$(basename "$f" .json)
+      [[ "$b" == "prometheus_snapshots" ]] && continue
+      jq -c --arg k "${b#prometheus_}" '[ $k, . ]' "$f"
+    done
+  ) > "$prometheus_snapshots_json"
+
   jq -n \
     --arg run_id "$RUN_ID" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -1072,6 +1427,10 @@ build_json_report() {
     --arg prometheus_url "$PROM_URL" \
     --arg gerrit_metrics_url "$GERRIT_METRICS_URL" \
     --arg gerrit_metrics_probe_status "$gerrit_metrics_probe_status" \
+    --arg gerrit_metrics_auth_mode "$GERRIT_METRICS_AUTH_MODE" \
+    --arg initial_gerrit_was_running "$INITIAL_GERRIT_WAS_RUNNING" \
+    --arg synth_profile "$SYNTH_PROFILE" \
+    --arg concurrency_steps "$CONCURRENCY_STEPS" \
     --argjson test_duration_seconds "$TEST_DURATION_SECONDS" \
     --argjson rest_concurrency "$REST_CONCURRENCY" \
     --argjson git_concurrency "$GIT_CONCURRENCY" \
@@ -1080,10 +1439,11 @@ build_json_report() {
     --argjson synth_initial_files "$SYNTH_INITIAL_FILES" \
     --argjson synth_initial_commits "$SYNTH_INITIAL_COMMITS" \
     --argjson synth_changes_per_project "$SYNTH_CHANGES_PER_PROJECT" \
+    --argjson synth_large_files_per_project "$SYNTH_LARGE_FILES_PER_PROJECT" \
+    --argjson synth_large_file_kb "$SYNTH_LARGE_FILE_KB" \
     --slurpfile summary "${RUN_DIR}/summary_by_operation.json" \
-    --slurpfile prom_before "${RUN_DIR}/prometheus_before.json" \
-    --slurpfile prom_during "${RUN_DIR}/prometheus_during.json" \
-    --slurpfile prom_after "${RUN_DIR}/prometheus_after.json" \
+    --slurpfile step_summary "${RUN_DIR}/summary_by_step.json" \
+    --slurpfile prometheus_snapshots "$prometheus_snapshots_json" \
     '{
       run: {
         run_id: $run_id,
@@ -1098,31 +1458,37 @@ build_json_report() {
         gerrit_test_http_user: $gerrit_test_http_user,
         prometheus_url: $prometheus_url,
         gerrit_metrics_url: $gerrit_metrics_url,
-        gerrit_metrics_probe_status: $gerrit_metrics_probe_status
+        gerrit_metrics_probe_status: $gerrit_metrics_probe_status,
+        gerrit_metrics_auth_mode: $gerrit_metrics_auth_mode
       },
       workload: {
-        test_duration_seconds: $test_duration_seconds,
-        rest_concurrency: $rest_concurrency,
-        git_clone_concurrency: $git_concurrency,
-        git_push_concurrency: $push_concurrency,
+        test_duration_seconds_per_step: $test_duration_seconds,
+        concurrency_steps: $concurrency_steps,
+        legacy_single_step_defaults: {
+          rest_concurrency: $rest_concurrency,
+          git_clone_concurrency: $git_concurrency,
+          git_push_concurrency: $push_concurrency
+        },
+        synthetic_profile: $synth_profile,
         synthetic_projects: $synth_projects,
         synthetic_initial_files_per_project: $synth_initial_files,
         synthetic_initial_commits_per_project: $synth_initial_commits,
-        synthetic_review_changes_per_project: $synth_changes_per_project
+        synthetic_review_changes_per_project: $synth_changes_per_project,
+        synthetic_large_files_per_project: $synth_large_files_per_project,
+        synthetic_large_file_kb: $synth_large_file_kb
+      },
+      startup_state: {
+        initial_gerrit_was_running: $initial_gerrit_was_running
       },
       operation_summary: $summary[0],
-      prometheus_snapshots: {
-        before: $prom_before[0],
-        during: $prom_during[0],
-        after: $prom_after[0]
-      },
+      step_operation_summary: $step_summary[0],
+      prometheus_snapshots: ($prometheus_snapshots[0] // {}),
       raw_files: {
         event_ndjson: "events.ndjson",
         summary_by_operation_json: "summary_by_operation.json",
+        summary_by_step_json: "summary_by_step.json",
         gerrit_metrics_sample_txt: "gerrit_metrics_sample.txt",
-        prometheus_before_json: "prometheus_before.json",
-        prometheus_during_json: "prometheus_during.json",
-        prometheus_after_json: "prometheus_after.json"
+        prometheus_snapshot_json_glob: "prometheus_*.json"
       }
     }' > "$JSON_OUT"
 
@@ -1134,20 +1500,24 @@ build_json_report() {
 ###############################################################################
 
 main() {
-  log "Starting Gerrit performance lab setup."
+  log "Starting Gerrit performance lab setup (v19)."
 
   install_packages
   create_gerrit_user
+  handle_initial_gerrit_state
   download_gerrit
   init_gerrit
   install_prometheus_plugin
   create_gerrit_service
-  configure_prometheus
   start_gerrit
+  select_gerrit_metrics_auth_mode
+  configure_prometheus
+  verify_prometheus_gerrit_scrape
   setup_git_identity
   validate_gerrit_http_credentials
   configure_test_permissions
   validate_http_git_push_permissions
+  verify_prometheus_gerrit_scrape
   create_synthetic_projects
   run_performance_test
   build_json_report
