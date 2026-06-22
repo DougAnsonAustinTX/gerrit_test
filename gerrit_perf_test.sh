@@ -4,6 +4,19 @@ set -Eeuo pipefail
 ###############################################################################
 # Gerrit basic performance lab for Ubuntu 24.04
 #
+# v21 changes:
+#   - Fixes v20 fresh-install diagnostic path by removing an accidental call to
+#     an undefined section helper before Gerrit has been initialized. The initial
+#     Gerrit process/port diagnostic banner is now printed directly, preserving
+#     the v20 stale-process cleanup behavior.
+#
+# v20 changes:
+#   - Fixes fresh-install startup detection/cleanup when a stale or manually
+#     started Gerrit process is listening on the configured Gerrit ports before
+#     the script-created systemd unit exists. v20 stops matching Gerrit processes
+#     by service, gerrit.sh, configured ports, site path, and GerritCodeReview
+#     command line before continuing.
+#
 # v19 changes:
 #   - Fixes Prometheus snapshot collection so large Gerrit metric query results
 #     are written to temporary JSON files and loaded with jq --slurpfile instead
@@ -63,13 +76,13 @@ set -Eeuo pipefail
 #   - Keeps systemd-safe Gerrit startup and Prometheus setup.
 #
 # Run:
-#   chmod +x gerrit_perf_lab_v19.sh
-#   sudo ./gerrit_perf_lab_v19.sh
+#   chmod +x gerrit_perf_test_v21.sh
+#   sudo ./gerrit_perf_test_v21.sh
 #
 # Optional:
-#   sudo GERRIT_VERSION=3.11.2 TEST_DURATION_SECONDS=180 ./gerrit_perf_lab_v19.sh
-#   sudo SYNTH_PROFILE=production_like ./gerrit_perf_lab_v19.sh
-#   sudo CONCURRENCY_STEPS="2,1,1 4,2,1 6,3,2 8,4,2" ./gerrit_perf_lab_v19.sh
+#   sudo GERRIT_VERSION=3.11.2 TEST_DURATION_SECONDS=180 ./gerrit_perf_test_v21.sh
+#   sudo SYNTH_PROFILE=production_like ./gerrit_perf_test_v21.sh
+#   sudo CONCURRENCY_STEPS="2,1,1 4,2,1 6,3,2 8,4,2" ./gerrit_perf_test_v21.sh
 #
 # WARNING:
 #   This is intentionally permissive for local lab testing only.
@@ -304,6 +317,28 @@ capture_prometheus_snapshot() {
   mv "${file}.tmp" "$file"
 }
 
+port_open_local() {
+  local port="$1"
+  timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1
+}
+
+list_gerrit_like_processes() {
+  pgrep -af 'GerritCodeReview|gerrit.*daemon|gerrit[.-].*war|com.google.gerrit' 2>/dev/null || true
+}
+
+list_port_owners() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print}' || true
+  fi
+}
+
+gerrit_like_process_exists() {
+  [[ -n "$(list_gerrit_like_processes)" ]]
+}
+
 is_gerrit_running_now() {
   if systemctl is-active --quiet gerrit-perf-lab.service 2>/dev/null; then
     return 0
@@ -313,25 +348,87 @@ is_gerrit_running_now() {
     return 0
   fi
 
-  if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${GERRIT_HTTP_PORT}" >/dev/null 2>&1; then
+  # On a fresh host the systemd unit may not exist yet, but a previous failed
+  # run can leave GerritCodeReview running under the invoking user. Treat that
+  # as an initially running Gerrit only when a Gerrit-like process is present or
+  # one of the configured Gerrit ports is open.
+  if gerrit_like_process_exists; then
     return 0
   fi
 
-  if timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${GERRIT_SSH_PORT}" >/dev/null 2>&1; then
+  if port_open_local "$GERRIT_HTTP_PORT" || port_open_local "$GERRIT_SSH_PORT"; then
     return 0
   fi
 
   return 1
 }
 
+terminate_matching_gerrit_processes() {
+  local signal="${1:-TERM}"
+
+  # Prefer exact site path matches when available. This catches java command
+  # lines that include "-d ${GERRIT_SITE}".
+  pkill -"${signal}" -f "${GERRIT_SITE}" >/dev/null 2>&1 || true
+
+  # Fresh-install failures can leave argv[0] as GerritCodeReview without the
+  # site path visible in ps output. This lab host is dedicated, so stop those too.
+  pkill -"${signal}" -f 'GerritCodeReview|com.google.gerrit.server.GerritServer|gerrit.*daemon|gerrit[.-].*war' >/dev/null 2>&1 || true
+}
+
+stop_initial_or_stale_gerrit() {
+  log "Stopping any initially running or stale Gerrit instance."
+
+  if systemctl list-unit-files gerrit-perf-lab.service >/dev/null 2>&1 || systemctl status gerrit-perf-lab.service >/dev/null 2>&1; then
+    systemctl stop gerrit-perf-lab.service >/dev/null 2>&1 || true
+  fi
+
+  if [[ -x "${GERRIT_SITE}/bin/gerrit.sh" ]]; then
+    "${GERRIT_SITE}/bin/gerrit.sh" stop >/dev/null 2>&1 || true
+  fi
+
+  terminate_matching_gerrit_processes TERM
+
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if ! gerrit_like_process_exists && ! port_open_local "$GERRIT_HTTP_PORT" && ! port_open_local "$GERRIT_SSH_PORT"; then
+      rm -f "${GERRIT_SITE}/logs/gerrit.pid" "${GERRIT_SITE}/gerrit.pid"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "Gerrit did not stop after TERM; sending KILL to matching Gerrit processes."
+  terminate_matching_gerrit_processes KILL
+  sleep 2
+  rm -f "${GERRIT_SITE}/logs/gerrit.pid" "${GERRIT_SITE}/gerrit.pid"
+
+  if gerrit_like_process_exists || port_open_local "$GERRIT_HTTP_PORT" || port_open_local "$GERRIT_SSH_PORT"; then
+    return 1
+  fi
+
+  return 0
+}
+
+print_initial_gerrit_state() {
+  echo "==================== Initial Gerrit process/port state ===================="
+  echo "Configured HTTP port: ${GERRIT_HTTP_PORT}"
+  list_port_owners "$GERRIT_HTTP_PORT" || true
+  echo
+  echo "Configured SSH port: ${GERRIT_SSH_PORT}"
+  list_port_owners "$GERRIT_SSH_PORT" || true
+  echo
+  echo "Gerrit-like processes:"
+  list_gerrit_like_processes || true
+}
+
 handle_initial_gerrit_state() {
   if is_gerrit_running_now; then
     INITIAL_GERRIT_WAS_RUNNING="true"
     log "Gerrit appears to already be running at script start; stopping it before setup."
-    stop_any_gerrit
-    sleep 3
+    print_initial_gerrit_state
 
-    if is_gerrit_running_now; then
+    if ! stop_initial_or_stale_gerrit; then
+      print_initial_gerrit_state
       print_gerrit_diagnostics
       die "Gerrit was running initially and did not stop cleanly. Refusing to continue."
     fi
@@ -364,6 +461,8 @@ install_packages() {
     apache2-utils \
     prometheus \
     prometheus-node-exporter \
+    lsof \
+    psmisc \
     python3 \
     python3-venv \
     procps \
@@ -418,6 +517,14 @@ stop_any_gerrit() {
   fi
 
   pkill -u "$GERRIT_USER" -f "gerrit.*${GERRIT_SITE}" >/dev/null 2>&1 || true
+  terminate_matching_gerrit_processes TERM
+  sleep 1
+
+  if gerrit_like_process_exists || port_open_local "$GERRIT_HTTP_PORT" || port_open_local "$GERRIT_SSH_PORT"; then
+    terminate_matching_gerrit_processes KILL
+    sleep 1
+  fi
+
   rm -f "${GERRIT_SITE}/logs/gerrit.pid" "${GERRIT_SITE}/gerrit.pid"
 }
 
@@ -1500,7 +1607,7 @@ build_json_report() {
 ###############################################################################
 
 main() {
-  log "Starting Gerrit performance lab setup (v19)."
+  log "Starting Gerrit performance lab setup (v20)."
 
   install_packages
   create_gerrit_user
